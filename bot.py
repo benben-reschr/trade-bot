@@ -55,65 +55,58 @@ from google.genai import types
 #   reason   : AIがそう判断した理由（人間が確認するためのメモ）
 # ============================================================================
 
+DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+        "qty": {"type": "integer"},
+        "reason": {"type": "string"},
+    },
+    "required": ["decision", "qty", "reason"],
+}
+
 
 # ============================================================================
 # 2. 安全ブレーキ（リミッター）
 # ============================================================================
 class SafetyLimiter:
-    """
-    AIの判断をそのまま証券会社アダプターに渡すのは危険なので、
-    その手前に必ずこのクラスを通します。
+    """AIの判断をそのまま発注せず、金額・回数の上限でチェックする安全装置。"""
 
-    - 1回あたりの発注金額が上限を超えていないか
-    - 1日の取引回数が上限を超えていないか
-
-    のチェックを行い、危険な発注は「物理的に」ブロックします。
-    """
-
-    def __init__(self, max_order_amount: int = 300_000, max_daily_trades: int = 5):
-        self.max_order_amount = max_order_amount      # 1回あたりの最大投資上限額（円）
-        self.max_daily_trades = max_daily_trades        # 1日の最大取引回数
-        self.trade_count_today = 0                      # 本日すでに行った取引回数
-        self.today = datetime.date.today()               # 日付が変わったらカウンターをリセットするために保持
-
-    def _reset_if_new_day(self):
-        """日付が変わっていたら、取引回数カウンターを0にリセットする"""
-        current_date = datetime.date.today()
-        if current_date != self.today:
-            self.today = current_date
-            self.trade_count_today = 0
-            print(f"[安全装置] 日付が変わったため、取引回数カウンターをリセットしました。")
+    def __init__(self, max_order_amount: int, max_daily_trades: int):
+        self.max_order_amount = max_order_amount
+        self.max_daily_trades = max_daily_trades
+        self.trade_count_today = 0
 
     def check(self, decision: dict, current_price: float) -> tuple[bool, str]:
-        """
-        発注前チェック。
-        戻り値: (発注してよいか True/False, 理由メッセージ)
-        """
-        self._reset_if_new_day()
-
-        # HOLD（様子見）は常に許可（発注自体が発生しないため）
+        # HOLD（様子見）は常に許可
         if decision["decision"] == "HOLD":
-            return True, "HOLDのため発注なし"
+            return True, "AIはHOLD（様子見）と判断。発注はスキップします。"
 
-        # --- チェック1: 1日の取引回数上限 ---
+        # 数量が0以下は不正
+        qty = decision.get("qty", 0)
+        if qty <= 0:
+            return False, f"数量が不正です（qty={qty}）。発注を中止します。"
+
+        # 1日の取引回数制限
         if self.trade_count_today >= self.max_daily_trades:
             return False, (
-                f"本日の取引回数が上限（{self.max_daily_trades}回）に達しているため、"
-                f"本日の自動売買を停止します。"
+                f"本日の取引回数上限（{self.max_daily_trades}回）に達しています。"
             )
 
-        # --- チェック2: 1回あたりの投資金額上限 ---
-        order_amount = current_price * decision["qty"]
+        # 発注金額の上限チェック
+        order_amount = current_price * qty
         if order_amount > self.max_order_amount:
             return False, (
                 f"発注金額 {order_amount:,.0f}円 が上限 "
-                f"{self.max_order_amount:,.0f}円 を超えているためブロックしました。"
+                f"{self.max_order_amount:,.0f}円 を超えています。"
             )
 
-        return True, "安全チェックOK"
+        return True, (
+            f"チェックOK: {decision['decision']} {qty}株 "
+            f"（約{order_amount:,.0f}円）"
+        )
 
     def record_trade(self):
-        """実際に発注が実行されたら、取引回数カウンターを1つ増やす"""
         self.trade_count_today += 1
 
 
@@ -121,130 +114,68 @@ class SafetyLimiter:
 # 3. 証券会社アダプター（アダプターパターンの本体）
 # ============================================================================
 class BrokerAdapter(ABC):
-    """
-    すべての証券会社アダプターが必ず実装しなければならない「共通の窓口」。
-    place_order() は常に「共通データ構造」を受け取る前提で設計する。
-    証券会社ごとの独自フォーマットへの変換は、このメソッドの「内部」で行う。
-    """
+    """証券会社ごとの発注APIの違いを吸収する共通インターフェース。"""
 
     @abstractmethod
-    def place_order(self, symbol: str, decision: dict, current_price: float):
-        ...
+    def place_order(self, symbol: str, decision: dict, current_price: float) -> bool:
+        """共通データ構造(decision)を、その証券会社の発注形式に翻訳して送信する。"""
+        raise NotImplementedError
 
     @abstractmethod
     def get_balance_info(self) -> str:
-        ...
+        raise NotImplementedError
 
 
 class VirtualBrokerAdapter(BrokerAdapter):
-    """
-    【スマホ検証用】仮想お財布アダプター。
-    実際の証券会社には接続せず、変数（メモリ上）で残高と保有株数を自己管理する。
-    100万円の仮想資金からスタートし、AIの判断に沿って売買のシミュレーションを行う。
-    """
+    """実際には発注せず、メモリ上でシミュレーションするだけの仮想証券会社。"""
 
-    def __init__(self, initial_balance: int = 1_000_000):
-        self.balance = initial_balance          # 仮想の現金残高
-        self.holdings: dict[str, int] = {}       # 銘柄コードごとの保有株数 {"7203.T": 100}
-        self.history: list[dict] = []            # 売買履歴のログ
+    def __init__(self, initial_balance: float = 1_000_000):
+        self.balance = initial_balance
+        self.holdings: dict[str, int] = {}
 
-    def place_order(self, symbol: str, decision: dict, current_price: float):
-        # ---- ここが「翻訳」部分：仮想ブローカーの場合は、共通データをそのまま
-        #      内部の残高・保有株数の増減計算に変換するだけでよい ----
-        qty = decision["qty"]
-        amount = current_price * qty
+    def place_order(self, symbol: str, decision: dict, current_price: float) -> bool:
+        action = decision["decision"]
+        qty = decision.get("qty", 0)
 
-        if decision["decision"] == "BUY":
-            if amount > self.balance:
-                print(f"  [仮想ブローカー] 残高不足のため発注できません（残高: {self.balance:,.0f}円）")
-                return False
-            self.balance -= amount
-            self.holdings[symbol] = self.holdings.get(symbol, 0) + qty
-            print(f"  [仮想ブローカー] {symbol} を {qty}株 買付 → {amount:,.0f}円 支払い")
-
-        elif decision["decision"] == "SELL":
-            held = self.holdings.get(symbol, 0)
-            if held < qty:
-                print(f"  [仮想ブローカー] 保有株数不足のため売却できません（保有: {held}株）")
-                return False
-            self.balance += amount
-            self.holdings[symbol] = held - qty
-            print(f"  [仮想ブローカー] {symbol} を {qty}株 売却 → {amount:,.0f}円 受取")
-
-        else:
-            print("  [仮想ブローカー] HOLDのため何もしません")
+        if action == "HOLD":
+            print(f"  [仮想証券] {symbol}: HOLD（発注なし）")
             return True
 
-        self.history.append({
-            "time": datetime.datetime.now().isoformat(),
-            "symbol": symbol,
-            **decision,
-            "price": current_price,
-        })
-        return True
+        cost = current_price * qty
+
+        if action == "BUY":
+            if cost > self.balance:
+                print(f"  [仮想証券] 残高不足のため発注失敗（必要額: {cost:,.0f}円）")
+                return False
+            self.balance -= cost
+            self.holdings[symbol] = self.holdings.get(symbol, 0) + qty
+            print(f"  [仮想証券] {symbol} を {qty}株 買付（{cost:,.0f}円）")
+            return True
+
+        if action == "SELL":
+            held = self.holdings.get(symbol, 0)
+            if qty > held:
+                print(f"  [仮想証券] 保有数不足のため発注失敗（保有: {held}株）")
+                return False
+            self.balance += cost
+            self.holdings[symbol] = held - qty
+            print(f"  [仮想証券] {symbol} を {qty}株 売却（{cost:,.0f}円）")
+            return True
+
+        print(f"  [仮想証券] 不明な指示のため発注失敗: {action}")
+        return False
 
     def get_balance_info(self) -> str:
         return f"仮想現金残高: {self.balance:,.0f}円 / 保有銘柄: {self.holdings}"
 
 
 class TachibanaDemoAdapter(BrokerAdapter):
-    """
-    【将来用・骨組みのみ】立花証券デモ環境用アダプター。
+    """立花証券デモAPI向けの骨組み（実装は今後追加）。"""
 
-    実際に発注APIへ接続するには、立花証券が提供するAPI仕様書に基づいて
-    ログイン・セッショントークンの取得などが別途必要になります。
-    ここでは「共通データ → 立花証券独自のJSON構造への翻訳マッピング」の
-    骨組みだけを示しています（実際の送信処理はコメントアウトしています）。
-    """
-
-    # 立花証券APIは銘柄コードの前にゼロ埋めなどのルールがある場合があるため、
-    # symbol（例: "7203.T"）から数字部分だけを取り出すヘルパー
-    @staticmethod
-    def _to_issue_code(symbol: str) -> str:
-        return symbol.split(".")[0]  # "7203.T" -> "7203"
-
-    def place_order(self, symbol: str, decision: dict, current_price: float):
-        # ------------------------------------------------------------------
-        # ★★★ ここが「翻訳マッピング」の核心部分 ★★★
-        # 共通データ {"decision": "BUY", "qty": 100} を、
-        # 立花証券が実際に要求するであろうJSON構造へ変換する。
-        # （フィールド名やコード値は仕様書のイメージに沿ったサンプルです）
-        # ------------------------------------------------------------------
-        order_side_map = {
-            "BUY": "1",   # 立花証券APIでは「買い」を "1" という文字列コードで表す想定
-            "SELL": "2",  # 「売り」は "2" という文字列コードで表す想定
-        }
-
-        if decision["decision"] == "HOLD":
-            print("  [立花デモ] HOLDのため発注リクエストは作成しません")
-            return True
-
-        tachibana_payload = {
-            "issueCode": self._to_issue_code(symbol),       # 銘柄コード（証券会社独自の項目名）
-            "orderSide": order_side_map[decision["decision"]],  # "1"（買）または "2"（売）
-            "orderQuantity": str(decision["qty"]),             # 数量は文字列で渡す想定
-            "orderPrice": "0",                                  # 成行注文の想定（0=成行のことが多い）
-            "orderType": "0",                                   # 執行条件（0=成行 のサンプル）
-        }
-
-        print("  [立花デモ] 共通データ → 立花フォーマットへ翻訳しました:")
-        print(f"    {json.dumps(tachibana_payload, ensure_ascii=False)}")
-
-        # ------------------------------------------------------------------
-        # 実際にAPIへ送信する場合は、以下のようなイメージになります。
-        # （デモ環境が利用可能になった時点で、認証情報を設定して有効化してください）
-        #
-        # import requests
-        # response = requests.post(
-        #     "https://demo-kabuka.e-shiten.jp/e_api_v4r5/receiveorder",
-        #     json=tachibana_payload,
-        #     headers={"Authorization": f"Bearer {YOUR_TACHIBANA_TOKEN}"},
-        # )
-        # response.raise_for_status()
-        # ------------------------------------------------------------------
-
-        print("  [立花デモ] ※現在は骨組みのみのため、実際の送信は行っていません。")
-        return True
+    def place_order(self, symbol: str, decision: dict, current_price: float) -> bool:
+        print("[立花デモ] 発注APIは未実装のため、発注をスキップしました。")
+        print(f"  （本来送るはずだった内容: {symbol}, {decision}）")
+        return False
 
     def get_balance_info(self) -> str:
         return "[立花デモ] 残高照会APIは未実装（骨組みのみ）"
@@ -254,65 +185,65 @@ class TachibanaDemoAdapter(BrokerAdapter):
 # 4. Gemini APIとの連携（AIに「共通データ構造」で判断させる）
 # ============================================================================
 def get_stock_data(symbol: str) -> dict:
-    """
-    yfinanceを使って日本株の直近データを取得する。
-    symbol例: "7203.T"（トヨタ自動車）
-    """
+    """yfinanceで直近の株価データを取得する。"""
     ticker = yf.Ticker(symbol)
-    # 直近10営業日分の日足データを取得
-    hist = ticker.history(period="10d")
+    hist = ticker.history(period="5d")
 
     if hist.empty:
-        raise ValueError(f"{symbol} のデータが取得できませんでした。銘柄コードを確認してください。")
+        raise ValueError(f"銘柄 {symbol} の株価データが取得できませんでした。")
 
-    latest = hist.iloc[-1]
+    current_price = float(hist["Close"].iloc[-1])
+    prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current_price
+    change_pct = (current_price - prev_close) / prev_close * 100 if prev_close else 0.0
+
     return {
         "symbol": symbol,
-        "current_price": float(latest["Close"]),
-        "recent_close_prices": [round(float(p), 1) for p in hist["Close"].tolist()],
-        "recent_volumes": [int(v) for v in hist["Volume"].tolist()],
+        "current_price": round(current_price, 1),
+        "previous_close": round(prev_close, 1),
+        "change_pct": round(change_pct, 2),
+        "volume": int(hist["Volume"].iloc[-1]),
+        "recent_high": round(float(hist["High"].max()), 1),
+        "recent_low": round(float(hist["Low"].min()), 1),
+        "timestamp": datetime.datetime.now().isoformat(),
     }
 
 
 def get_ai_decision(client: genai.Client, stock_data: dict) -> dict:
-    """
-    Geminiに株価データを渡して、売買判断を「共通データ構造」のJSONで受け取る。
-
-    ポイント：
-    - response_mime_type="application/json" を指定することで、
-      Geminiに「JSON以外の説明文（前置き等）を一切出力させない」ようにする。
-    - プロンプト内でも出力すべきJSONのキーを明示し、AIの出力形式をブレさせない。
-    """
+    """Geminiに株価データを渡し、共通データ構造(JSON)で売買判断を返させる。"""
     prompt = f"""
-あなたは日本株のテクニカル分析アシスタントです。
-以下の株価データをもとに、売買判断を行ってください。
+あなたは日本株のトレーディングアシスタントです。
+以下の株価データだけを根拠に、売買判断を行ってください。
 
-銘柄コード: {stock_data['symbol']}
+銘柄: {stock_data['symbol']}
 現在値: {stock_data['current_price']}円
-直近の終値の推移（古い→新しい順）: {stock_data['recent_close_prices']}
-直近の出来高の推移（古い→新しい順）: {stock_data['recent_volumes']}
+前日終値: {stock_data['previous_close']}円
+騰落率: {stock_data['change_pct']}%
+出来高: {stock_data['volume']}
+直近高値: {stock_data['recent_high']}円
+直近安値: {stock_data['recent_low']}円
 
-必ず以下のJSON形式のみで回答してください（他の文章は一切不要です）。
-- decision: "BUY"（買い） / "SELL"（売り） / "HOLD"（様子見）のいずれか
-- qty: 発注する株数（100株単位の整数。取引しない場合は0）
-- reason: 判断理由を日本語で簡潔に（50文字程度）
+指定されたJSON形式のみで回答してください。
+qtyは100株単位（単元株）にしてください。HOLDの場合はqtyを0にしてください。
 """
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
+            response_schema=DECISION_SCHEMA,
         ),
     )
 
-    # Geminiはここで「綺麗なJSON文字列」のみを返してくる想定なので、そのままパースする
-    decision = json.loads(response.text)
+    try:
+        decision = json.loads(response.text)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise ValueError(f"Geminiの応答をJSONとして解析できませんでした: {e}\n応答内容: {response.text}")
 
-    # 万が一AIが不正な形式で返してきた場合に備えた最低限のバリデーション
-    if decision.get("decision") not in ("BUY", "SELL", "HOLD"):
-        raise ValueError(f"AIから予期しない形式のレスポンスが返りました: {decision}")
-    decision["qty"] = int(decision.get("qty", 0))
+    # 必須キーの検証
+    for key in ("decision", "qty", "reason"):
+        if key not in decision:
+            raise ValueError(f"Geminiの応答に必須キー '{key}' がありません: {decision}")
 
     return decision
 
@@ -347,36 +278,40 @@ def main():
 
     client = genai.Client(api_key=api_key)
 
-    # --- ステップ1: 株価データの取得 ---
-    print(f"\n[1/4] {target_symbol} の株価データを取得しています...")
-    stock_data = get_stock_data(target_symbol)
-    print(f"  現在値: {stock_data['current_price']}円")
+    try:
+        # --- ステップ1: 株価データの取得 ---
+        print(f"\n[1/4] {target_symbol} の株価データを取得しています...")
+        stock_data = get_stock_data(target_symbol)
+        print(f"  現在値: {stock_data['current_price']}円")
 
-    # --- ステップ2: Geminiに売買判断をさせる（共通データ構造で受け取る） ---
-    print("\n[2/4] Geminiに売買判断をリクエストしています...")
-    decision = get_ai_decision(client, stock_data)
-    print(f"  AIの判断: {decision}")
+        # --- ステップ2: Geminiに売買判断をさせる（共通データ構造で受け取る） ---
+        print("\n[2/4] Geminiに売買判断をリクエストしています...")
+        decision = get_ai_decision(client, stock_data)
+        print(f"  AIの判断: {decision}")
 
-    # --- ステップ3: 安全フィルターを通す ---
-    print("\n[3/4] 安全フィルターでチェックしています...")
-    ok, message = limiter.check(decision, stock_data["current_price"])
-    print(f"  結果: {message}")
+        # --- ステップ3: 安全フィルターを通す ---
+        print("\n[3/4] 安全フィルターでチェックしています...")
+        ok, message = limiter.check(decision, stock_data["current_price"])
+        print(f"  結果: {message}")
 
-    if not ok:
-        print("\n[停止] 安全フィルターにより発注はブロックされました。処理を終了します。")
-        return
+        if not ok:
+            print("\n[停止] 安全フィルターにより発注はブロックされました。処理を終了します。")
+            return
 
-    # --- ステップ4: アダプター経由で発注（ここで初めて証券会社ごとのJSON翻訳が行われる） ---
-    print("\n[4/4] アダプター経由で注文を実行しています...")
-    success = my_broker.place_order(target_symbol, decision, stock_data["current_price"])
+        # --- ステップ4: アダプター経由で発注（ここで初めて証券会社ごとのJSON翻訳が行われる） ---
+        print("\n[4/4] アダプター経由で注文を実行しています...")
+        success = my_broker.place_order(target_symbol, decision, stock_data["current_price"])
 
-    if success and decision["decision"] != "HOLD":
-        limiter.record_trade()
+        if success and decision["decision"] != "HOLD":
+            limiter.record_trade()
 
-    print("\n" + "-" * 70)
-    print(my_broker.get_balance_info())
-    print(f"本日の取引回数: {limiter.trade_count_today} / {limiter.max_daily_trades}")
-    print("-" * 70)
+        print("\n" + "-" * 70)
+        print(my_broker.get_balance_info())
+        print(f"本日の取引回数: {limiter.trade_count_today} / {limiter.max_daily_trades}")
+        print("-" * 70)
+
+    except Exception as e:
+        print(f"\n[エラー] 処理中に例外が発生しました: {e}")
 
 
 if __name__ == "__main__":
